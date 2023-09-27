@@ -1,0 +1,356 @@
+# %%
+# !pip install pyomo
+# !pip install gurobipy
+# !pip install xlsxwriter
+
+# %%
+import pandas as pd
+import numpy as np
+import itertools
+import pyomo.environ as pe
+import pyomo.gdp as gdp
+import gurobipy
+import pyomo.opt as po
+
+import modelfunctions as mfunc
+
+# %%
+version = "V0"
+sets = mfunc.create_sets(
+    {
+        'K_prep': ["Manure Fermentation w/ CO2", "Manure Fermentation w/ Hydrogen"],
+        'K_pur' : ["Lignin Recovery"],
+        'F'     : ["Manure"],
+        'P'     : ["Lignin"],
+        'Q'     : [150, 200, 1000]
+    }
+)
+sets.keys()
+
+# %%
+dfs = mfunc.import_paremeters(sets, f"Inputs\inputs-{version}.xlsx")
+dfs.keys()
+
+# %%
+def create_n_solve():
+    ##################################################################################
+    # MODEL
+    ##################################################################################
+
+
+    model = pe.ConcreteModel()
+    bigM = 10**5
+
+    ####################
+    # SETS
+    ####################
+
+    # Initialize the sets based on the 'sets' dictionary
+    model.T = pe.Set(initialize=sets['T'])  # Indices for periods
+
+    model.S = pe.Set(initialize=sets['S'])  # Indices for suppliers
+    model.X = pe.Set(initialize=sets['X'])  # Indices for plant sites
+    model.M = pe.Set(initialize=sets['M'])  # Indices for markets
+
+    model.F = pe.Set(initialize=sets['F'])  # Indices for feedstocks
+
+    model.C_Solid = pe.Set(initialize=sets['C_Solid'])  # Indices for solid components
+    model.C_Liquid = pe.Set(initialize=sets['C_Liquid'])  # Indices for liquid components
+    model.C = model.C_Solid | model.C_Liquid # Indices for all components
+
+    model.P = pe.Set(initialize=sets['P'])  # Indices for final products
+
+    model.FP = model.F | model.P
+
+    model.BP = pe.Set(initialize=sets['BP'])  # Indices for by-products
+    model.RM = pe.Set(initialize=sets['RM'])  # Indices for raw materials
+    model.E = pe.Set(initialize=sets['E'])  # Indices for energy consupmtion
+    model.UT = pe.Set(initialize=sets['UT'])  # Indices for other utilities
+    model.U = model.RM | model.E | model.UT  # Indices for all utilities
+
+    model.K_prep = pe.Set(initialize=sets['K_prep'])  # Indices for preprocessing options
+    model.K_pret = pe.Set(initialize=sets['K_pret'])  # Indices for pretreatment options
+    model.K_conv_F = pe.Set(initialize=sets['K_conv_F']) #Indices for fermentation options
+    model.K_conv_CF = pe.Set(initialize=sets['K_conv_CF']) #Indices for co-fermentation options
+    model.K_conv_O = pe.Set(initialize=sets['K_conv_O']) #Indices for other conversion options
+    model.K_conv =  model.K_conv_F | model.K_conv_CF | model.K_conv_O  # Indices for all conversion options
+    model.K_pur = pe.Set(initialize=sets['K_pur'])  # Indices for purification options
+    model.K = model.K_prep | model.K_pret | model.K_conv | model.K_pur # Indices for all process options
+
+    model.J = pe.Set(initialize=sets['J'])  # Indices for fermentation strains
+    model.Q = pe.Set(initialize=sets['Q'])  # Indices for technology capacity levels
+
+    # Auxiliary Sets
+    model.Flow = pe.Set(initialize=["IN", "OUT"])
+    model.MinMax = pe.Set(initialize=["Min", "Max"])
+
+    ####################
+    # Parameters
+    ####################
+
+    ## Compatibility_SupplierPlant
+    parameter_dict = dfs['Compatibility_SupplierPlant'].set_index(['S', 'X']).Value.dropna().to_dict()
+    model.Compatibility_SupplierPlant = pe.Param(model.S, model.X, initialize=parameter_dict, default=0)
+    # Compatibility_PlantMarket
+    parameter_dict = dfs['Compatibility_PlantMarket'].set_index(['X', 'M']).Value.dropna().to_dict()
+    model.Compatibility_PlantMarket = pe.Param(model.X, model.M, initialize=parameter_dict, default=0)
+    # Distances_SupplierPlant
+    parameter_dict = dfs['Distances_SupplierPlant'].set_index(['S', 'X']).Value.dropna().to_dict()
+    model.Distances_SupplierPlant = pe.Param(model.S, model.X, initialize=parameter_dict, default=0)
+    # Distances_PlantMarket
+    parameter_dict = dfs['Distances_PlantMarket'].set_index(['X', 'M']).Value.dropna().to_dict()
+    model.Distances_PlantMarket = pe.Param(model.X, model.M, initialize=parameter_dict, default=0)
+    # Transportation_Cost
+    parameter_dict = dfs['Economics'][dfs['Economics'].Indicator == 'TrasnportationCost'].reset_index().Value[0]
+    model.Transportation_Cost = pe.Param(initialize=parameter_dict, default=0)
+
+
+    # Storage_Cost
+    parameter_dict = dfs['Economics'][dfs['Economics'].Indicator == 'HoldingCostFactor'].reset_index().Value[0]
+    model.HoldingCostFactor = pe.Param(initialize=parameter_dict, default=0.4)
+    parameter_dict = dfs['Economics'][dfs['Economics'].Indicator == 'FeedstockStorageCost'].reset_index().Value[0]
+    model.FeedstockStorageCost = pe.Param(initialize=parameter_dict, default=0)
+
+    # Compatibility_Purification
+    parameter_dict = dfs['Compatibility_Purification'].set_index(['P', 'K_pur']).Value.dropna().to_dict()
+    model.Compatibility_Purification = pe.Param(model.P, model.K_pur, initialize=parameter_dict, default=0)
+
+    # Compatibility_Conversion
+    parameter_dict = dfs['Compatibility_Conversion'].set_index(['K_pret', 'K_conv', 'J']).Value.dropna().to_dict()
+    model.Compatibility_Conversion = pe.Param(model.K_pret, model.K_conv, model.J, initialize=parameter_dict, default=0)
+
+    # Yield_Hydrolysis
+    parameter_dict = dfs['Yield_Hydrolysis'].set_index(['K_conv', 'K_pret', 'C', 'P']).Value.dropna().to_dict()
+    model.Yield_Hydrolysis = pe.Param(model.K_conv, model.K_pret, model.C, model.P, initialize=parameter_dict, default=1)
+
+    # Solid_Loading
+    parameter_dict = dfs['Solid_Loading'].set_index(['K_conv']).Value.dropna().to_dict()
+    model.Solid_Loading = pe.Param(model.K_conv, initialize=parameter_dict, default=1)
+
+    # Compatibility_Pretreatment
+    parameter_dict = dfs['Compatibility_Pretreatment'].set_index(['K_prep', 'K_pret']).Value.dropna().to_dict()
+    model.Compatibility_Pretreatment = pe.Param(model.K_prep, model.K_pret, initialize=parameter_dict, default=0)
+
+    # Feedstock_Composition
+    parameter_dict = dfs['Feedstock_Composition'].set_index(['C', 'F']).Value.dropna().to_dict()
+    model.Feedstock_Composition = pe.Param(model.C, model.F, initialize=parameter_dict, default=0)
+    # Yield_Pretreatment
+    parameter_dict = dfs['Yield_Pretreatment'].set_index(['C', 'K_pret']).Value.dropna().to_dict()
+    model.Yield_Pretreatment = pe.Param(model.C, model.K_pret, initialize=parameter_dict, default=0)
+    # Yield_Conversion
+    parameter_dict = dfs['Yield_Conversion'][['P', 'C', 'K_conv', 'J', "Value"]].set_index(['P', 'C', 'K_conv', 'J']).Value.dropna().to_dict()
+    model.Yield_Conversion = pe.Param(model.P, model.C, model.K_conv, model.J, initialize=parameter_dict, default=0)
+    # Yield_Purification 
+    parameter_dict = dfs['Yield_Purification'].set_index(['P', 'K_pur']).Value.dropna().to_dict()
+    model.Yield_Purification = pe.Param(model.P, model.K_pur, initialize=parameter_dict, default=0)
+    # Demand
+    parameter_dict = dfs['Demand'].set_index(['P', 'M', 'T']).Value.dropna().to_dict()
+    model.Demand = pe.Param(model.P, model.M, model.T, initialize=parameter_dict, default=0)
+    # Supply
+    parameter_dict = dfs['Supply'].set_index(['F', 'S', 'T']).Value.dropna().to_dict()
+    model.Supply = pe.Param(model.F, model.X, model.T, initialize=parameter_dict, default=0)
+    # Price
+    parameter_dict = dfs['Price_F'].set_index(['F', 'S', 'T']).Value.dropna().to_dict()
+    model.Price_F = pe.Param(model.F, model.S, model.T, initialize=parameter_dict, default=0)
+    parameter_dict = dfs['Price_U'].dropna().set_index(['U', 'X', 'T']).Value.dropna().to_dict()
+    model.Price_U = pe.Param(model.U, model.X, model.T, initialize=parameter_dict, default=0)
+    parameter_dict = dfs['Price_P'].set_index(['P', 'M', 'T']).Value.dropna().to_dict()
+    model.Price_P = pe.Param(model.P, model.M, model.T, initialize=parameter_dict, default=0)
+    # Technology_Cost
+    parameter_dict = dfs['Technology_Cost'].set_index(['K']).Value.dropna().to_dict()
+    model.Technology_Cost = pe.Param(model.K, initialize=parameter_dict, default=0)
+    parameter_dict = dfs['Technology_Cost'].set_index(['K']).BaseScale.dropna().to_dict()
+    model.Technology_BaseScale = pe.Param(model.K, initialize=parameter_dict, default=0, within = pe.NonNegativeReals)
+    parameter_dict = dfs['Technology_Cost'].set_index(['K']).Flow.dropna().to_dict()
+    model.Technology_Flow = pe.Param(model.K, initialize=parameter_dict, default="IN", within = model.Flow)
+    parameter_dict = dfs['Technology_Cost'].set_index(['K']).ScaleFactor.dropna().to_dict()
+    model.Technology_ScaleFactor = pe.Param(model.K, initialize=parameter_dict, default=0, within = pe.NonNegativeReals)
+    parameter_dict = dfs['Technology_Cost'].set_index(['K']).InstalationFactor.dropna().to_dict()
+    model.Technology_InstalationFactor = pe.Param(model.K, initialize=parameter_dict, default=0, within = pe.NonNegativeReals)
+    parameter_dict = dfs['CEPCI'].set_index(['T']).Value.dropna().to_dict()
+    model.CEPCI = pe.Param(model.T, initialize=parameter_dict, default=0)
+
+    # Operating_Cost (same structure as Depreciation_Factor)
+    parameter_dict = dfs['Economics'][dfs['Economics'].Indicator == 'OperatingCostFactor'].reset_index().Value[0]
+    model.Operating_Cost = pe.Param(initialize=parameter_dict, default=0)
+    # Maintenance_Cost (same structure as Depreciation_Factor)
+    parameter_dict = dfs['Economics'][dfs['Economics'].Indicator == 'MaintenanceCostFactor'].reset_index().Value[0]
+    model.Maintenance_Cost = pe.Param(initialize=parameter_dict, default=0)
+
+    depreciationfactor = (1 - dfs['Economics'][dfs['Economics'].Indicator == 'SalvageValue'].reset_index().Value[0]) / dfs['Economics'][dfs['Economics'].Indicator == 'LifeCycle'].reset_index().Value[0]
+    model.DepreciatonFactor = pe.Param(initialize=depreciationfactor, default=0)
+
+    # Utility_Consumption
+    parameter_dict = dfs['Utility_Consumption'].set_index(['U', 'K']).Value.dropna().to_dict()
+    model.Utility_Consumption = pe.Param(model.U, model.K, initialize=parameter_dict, default=0)
+    parameter_dict = dfs['Utility_Consumption'].set_index(['U', 'K']).Flow.dropna().to_dict()
+    model.Utility_Consumption_Flow = pe.Param(model.U, model.K, initialize=parameter_dict,  default="IN", within = model.Flow)
+    # Byproduct_Production
+    parameter_dict = dfs['Byproduct_Production'].set_index(['BP', 'K']).Value.dropna().to_dict()
+    model.Byproduct_Production = pe.Param(model.BP, model.K, initialize=parameter_dict, default=0)
+
+
+    ####################
+    # Binary Variables
+    ####################
+
+    # Indicates if technology k with capacity q is chosen to be installed in location x, at period t
+    model.Y_tech = pe.Var(model.K, model.Q, model.X, model.T, domain=pe.Binary)
+
+    # Indicates if supplier S in chosen for feestock F in plant X i at period t
+    model.Y_supply = pe.Var(model.S, model.F, model.X,  model.T, initialize=0, domain=pe.Binary)
+    # Indicates if preprocessing option k_prep in plant x is chosen for feedstock f at period t
+    model.Y_prep = pe.Var(model.F, model.K_prep, model.X,  model.T, domain=pe.Binary)
+    # Indicates if pretreatment option k_pret is chosen for feedstock f at period t
+    model.Y_pret = pe.Var(model.F, model.K_pret, model.X, model.T, domain=pe.Binary)
+    # Indicates if fermentation option k_conv with strain j is chosen to produce final product p with component c at period t
+    model.Y_conv = pe.Var(model.F, model.P, model.K_conv, model.X, model.J, model.T, domain=pe.Binary)
+
+    # Indicates if purification option k_pur is chosen for product p at period t
+    model.Y_pur = pe.Var(model.P, model.K_pur, model.X, model.T, domain=pe.Binary)
+    # Indicates if market P in chosen for product P in plant X i at period t
+    model.Y_market = pe.Var(model.M, model.P, model.X,  model.T, domain=pe.Binary)
+    # Indicates if there is a transport between 2 geogrpahies at time T
+    model.Y_transport_market = pe.Var(model.X, model.M, model.T, domain = pe.Binary)
+    model.NT = pe.Var(model.X, model.M, model.T, domain = pe.NonNegativeIntegers)
+
+    ####################
+    # Continuous Variables
+    ####################
+
+    # Inventory (Storage) fo fp at plant x at time t
+    model.ST = pe.Var(model.FP, model.X, model.T, domain = pe.NonNegativeReals)
+
+    # Supplied feedstock f from supplier s in plant x
+    model.F_in_feed = pe.Var(model.S, model.F, model.X, model.T, domain=pe.NonNegativeReals)
+
+    # Quantity of feedstock f going into preprocessing k_prep at period t
+    model.F_in_prep = pe.Var(model.F, model.K_prep, model.X, model.T, domain=pe.NonNegativeReals)# Quantity of feedstock f going into preprocessing k_prep at period t
+    model.F_out_prep = pe.Var(model.F, model.K_prep, model.X, model.T, domain=pe.NonNegativeReals)
+
+    # Quantity of feedstock f going into pretreatment k_pret at period t
+    model.F_in_pret = pe.Var(model.F, model.K_pret, model.X, model.T, domain=pe.NonNegativeReals)
+    # Quantity of component c going out of pretreatment k_pret at period t
+    model.F_out_pret = pe.Var(model.C, model.F, model.K_pret, model.X, model.T, domain=pe.NonNegativeReals)
+
+
+    # Quantity of component c going into conversion k_conv with fermentation strain j at period t to produce product p
+    model.F_in_conv = pe.Var(model.C, model.F, model.P, model.K_conv, model.X, model.J, model.T, domain=pe.NonNegativeReals)
+    # Quantity of component c going into conversion k_conv with fermentation strain j at period t to produce product p
+    model.F_out_conv = pe.Var(model.P, model.F, model.K_conv, model.X, model.J, model.T, domain=pe.NonNegativeReals)
+
+    # Bioreactor Liquid
+    model.F_liquid_conv = pe.Var(model.K_conv, model.X, model.T, domain = pe.Reals)
+    model.F_water_conv = pe.Var(model.K_conv, model.X, model.T, domain = pe.NonNegativeReals)
+
+    # Quantity of product p going into purification k_conv at period t
+    model.F_in_pur = pe.Var(model.P, model.K_pur, model.X, model.T, domain=pe.NonNegativeReals)
+    # Quantity of product p going out of purification k_pur at period t
+    model.F_out_pur = pe.Var(model.P, model.K_pur, model.X, model.T, domain=pe.NonNegativeReals)
+
+    # Quanitity of product leaving plant to market
+    model.F_out_prod = pe.Var(model.M, model.P, model.X,  model.T, domain=pe.NonNegativeReals)
+
+
+    # Total flow of utility u consumed in process k at period t
+    model.F_util = pe.Var(model.U, model.K, model.X, model.T, domain=pe.Reals)
+    # Total flow of byproduct bp generated in process k at period t
+    model.F_bypr = pe.Var(model.BP, model.K, model.X, model.T, domain=pe.NonNegativeReals)
+
+    # Capital investment at period t
+    model.CAPEX = pe.Var(model.X, model.T, domain=pe.NonNegativeReals)
+
+    ####################
+    # Constraints
+    ####################
+
+
+
+    # Choosing Processes
+
+    # Big-M: Choosing pathways
+    M = bigM 
+    
+
+
+
+    ####################
+    # Objecitve
+    ####################
+
+    model.Util_Cost = pe.Var(domain = pe.Reals)
+    model.Util_Cost_calc = pe.Constraint(rule = lambda m: m.Util_Cost == sum(sum(m.F_util[u, k, x, t] for k in model.K) * m.Price_U[u, x, t] for u in model.U for x in m.X for t in m.T) )
+
+
+    model.EBIT_Plant = pe.Var(model.X, model.T, domain = pe.Reals)
+    model.EBIT_Plant_calc = pe.Constraint(model.X, model.T,
+                                    rule=lambda m, x, t: 
+                                    m.EBIT_Plant[x, t] == sum(sum(m.F_out_prod[mk, p, x, t] * m.Price_P[p, mk, t] for p in model.P) for mk in model.M) \
+                                    - sum(sum(m.F_in_feed[s, f, x, t] * m.Price_F[f, s, t] for f in model.F) for s in model.S) 
+                                    - sum(sum(m.F_util[u, k, x, t] for k in model.K) * m.Price_U[u, x, t] for u in model.U)
+                                    # Transportation
+                                    - m.Transportation_Cost * (sum(m.F_in_feed[s, f, x, t] * m.Distances_SupplierPlant[s, x] for f in model.F for s in model.S) + sum(model.NT[x, mk, t] * 0.06 * m.Distances_PlantMarket[x, mk] for mk in model.M))
+                                    # Storage
+                                    - m.HoldingCostFactor *sum(m.ST[p, x, t] * m.Price_P[p, x, t] for p in model.P) + m.FeedstockStorageCost * sum(m.ST[f, x, t] for f in model.F)
+                                    # Operating & Maintenance Cost
+                                    #- (m.Operating_Cost[t] + m.Maintenance_Cost[t])* m.CAPEX[x, t]
+                                    # Depreciaiton for Tax Shield at period T (all invested capex until t)
+                                    #- sum(m.CAPEX[x, t_] for t_ in range(1, t + 1)) * model.DepreciatonFactor 
+                                    )
+
+    model.EBIT = pe.Var(model.T, domain = pe.Reals)
+    model.EBIT_calc = pe.Constraint(model.T,
+                                    rule=lambda m, t: 
+                                    m.EBIT[t] == sum(m.EBIT_Plant[x, t] for x in m.X))
+
+
+    def OP_rule(m):      
+        return sum( m.EBIT[t] for t in m.T)
+    def NPV_rule(m):      
+        return sum( (m.EBIT_Plant[x, t] - m.CAPEX[x, t]) for x in model.X for t in m.T)
+
+    model.Objective_function = pe.Objective(rule = OP_rule, sense = pe.maximize) 
+
+    ####################
+    # Solve
+    ####################
+    pe.TransformationFactory('gdp.bigm').apply_to(model, bigM=M)
+    solver = po.SolverFactory("gurobi", solver_io="python")
+    solver_parameters = "ResultFile=iismodel.mps" # write an ILP file to print the IIS
+    solver.options['DualReductions'] = 0
+    #solver.options['NonConvex'] = 2
+    results = solver.solve(model, 
+                        options_string=solver_parameters
+                        )
+    return results, model.EBIT[1].value, model
+
+# %%
+results, ebit, model = create_n_solve()
+results.write()
+
+# %%
+mfunc.print_vars(model)
+
+# %%
+def iterate_solve(n, wr = None):
+    time_list = []
+    obj = []
+    print("Let's go!")
+    for i in range(n):
+        res, ebit, model = create_n_solve()
+        print("Iteration", i + 1, "|", res.solver.wallclock_time, "|", ebit)
+        time_list.append(res.solver.wallclock_time)
+        obj.append(ebit)
+    df = pd.DataFrame({"Obj":obj, "SolveTime":time_list})
+    if wr:
+        df.to_excel("results.xslx")
+    return df, model
+
+# %%
+#df, m = iterate_solve(5)
+#df.to_excel(f"results-{version}.xlsx")
+
+# %%
+
+
+
