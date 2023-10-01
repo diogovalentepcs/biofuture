@@ -3,10 +3,6 @@ BIOFUTURE is a decision-support framework for sustainable Waste-to-X biorefinery
 
 This package is a work in progress. BIOFUTURE will be in continuous development and all contributions are welcomed.
 
-Find more information here (hyperlinks will be available soon):
-* Thesis document
-* Thesis presentation
-
 # Framework
 
 BIOFUTURE (Biorefinery supply-chaIn Optimization Framework for sUsTainable Upcycling of oRganic wastE)assists in the analysis of the optimal design and planning of biorefinery supplychains in three main interactive stages that feed information into each other: (i) Selection of Supply Chain Network, (ii) Supply, Demand, and Price Forecasting; and (iii) Supply-Chain MultiObjective Optimization. Each stage is further characterized by its own step-by-step methodology, which requires decision-maker interaction with the open-source tool.
